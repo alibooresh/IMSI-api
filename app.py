@@ -8,6 +8,7 @@ import threading
 from datetime import datetime
 from collections import defaultdict
 import sqlite3
+import shlex
 
 from models import db, Scan, ScanDetail, Observation
 
@@ -16,6 +17,12 @@ CORS(app)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+SCRIPT_CONFIG = {
+    "imsi":  "--sniff",
+    "imsi2": "--sniff -a",
+    "imsi3": "--sniff --port 4729",
+    "imsi4": "--sniff --port 4730"
+}
 
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{os.path.join(BASE_DIR, 'sherlock_scans.db')}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -150,7 +157,33 @@ def get_imsi():
     except Exception as e:
         return jsonify({"error": "internal server error", "details": str(e), "trace": traceback.format_exc()}), 500
 
+@app.route("/run/script", methods=["POST"])
+def run_script():
+    data = request.get_json()
 
+    script_type = data.get("scriptType")
+    file_path   = data.get("filePath")
+    password    = data.get("password")
+
+    if script_type not in SCRIPT_CONFIG:
+        return jsonify({"error": "Invalid scriptType"}), 400
+
+    args = SCRIPT_CONFIG[script_type]
+
+    command = f"echo {shlex.quote(password)} | sudo -S python3 {shlex.quote(file_path)} {args}"
+
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    return jsonify({
+        "status": "started",
+        "executed_command": command
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
