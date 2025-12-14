@@ -162,11 +162,21 @@ def run_script():
     data = request.get_json()
 
     script_type = data.get("scriptType")
-    file_path   = data.get("filePath")
+    file_path   = data.get("filePath")   # مثلا: simple_IMSI-catcher.py
     password    = data.get("password")
+    work_dir    = data.get("workDir")    # مثلا: /usr/src/IMSI-catcher
 
     if script_type not in SCRIPT_CONFIG:
         return jsonify({"error": "Invalid scriptType"}), 400
+
+    if not file_path or not work_dir:
+        return jsonify({"error": "filePath and workDir are required"}), 400
+
+    if not os.path.isabs(work_dir):
+        return jsonify({"error": "workDir must be an absolute path"}), 400
+
+    if not os.path.isdir(work_dir):
+        return jsonify({"error": "workDir does not exist"}), 404
 
     args = SCRIPT_CONFIG[script_type]
 
@@ -175,6 +185,7 @@ def run_script():
     process = subprocess.Popen(
         command,
         shell=True,
+        cwd=work_dir,              
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
@@ -182,8 +193,12 @@ def run_script():
 
     return jsonify({
         "status": "started",
-        "executed_command": command
+        "workDir": work_dir,
+        "file": file_path,
+        "scriptType": script_type,
+        "pid": process.pid
     })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
