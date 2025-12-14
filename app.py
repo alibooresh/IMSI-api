@@ -160,43 +160,64 @@ def get_imsi():
 @app.route("/run/script", methods=["POST"])
 def run_script():
     data = request.get_json()
-
+    print("RAW DATA:", data)
     script_type = data.get("scriptType")
-    file_path   = data.get("filePath")   # مثلا: simple_IMSI-catcher.py
+    file_name   = data.get("filePath")   # فقط اسم فایل
     password    = data.get("password")
-    work_dir    = data.get("workDir")    # مثلا: /usr/src/IMSI-catcher
+    work_dir    = data.get("workDir")
 
+    # ---- validation ----
     if script_type not in SCRIPT_CONFIG:
         return jsonify({"error": "Invalid scriptType"}), 400
 
-    if not file_path or not work_dir:
-        return jsonify({"error": "filePath and workDir are required"}), 400
-
-    if not os.path.isabs(work_dir):
-        return jsonify({"error": "workDir must be an absolute path"}), 400
+    # if not work_dir or not os.path.isabs(work_dir):
+    #     return jsonify({"error": "workDir must be an absolute path"}), 400
 
     if not os.path.isdir(work_dir):
-        return jsonify({"error": "workDir does not exist"}), 404
+        return jsonify({"error": "workDir does not exist"}), 400
+
+    if not file_name:
+        return jsonify({"error": "filePath (file name) is required"}), 400
+
+    script_path = os.path.join(work_dir, file_name)
+
+    if not os.path.isfile(script_path):
+        return jsonify({"error": "script file not found", "path": script_path}), 404
 
     args = SCRIPT_CONFIG[script_type]
 
-    command = f"echo {shlex.quote(password)} | sudo -S python3 {shlex.quote(file_path)} {args}"
+    command = [
+        "sudo",
+        "-S",
+        "python3",
+        script_path,
+        *args.split(),
+        "--sqlite",
+        "imsi.sqlite"
+    ]
 
-    process = subprocess.Popen(
-        command,
-        shell=True,
-        cwd=work_dir,              
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=work_dir,                 
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        process.stdin.write(password + "\n")
+        process.stdin.flush()
+
+    except Exception as e:
+        return jsonify({"error": "failed to start process", "details": str(e)}), 500
 
     return jsonify({
         "status": "started",
         "workDir": work_dir,
-        "file": file_path,
-        "scriptType": script_type,
-        "pid": process.pid
+        "script": script_path,
+        "command": " ".join(command)
     })
 
 
