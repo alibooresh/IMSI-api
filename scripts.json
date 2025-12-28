@@ -1,0 +1,23 @@
+{
+    "simple-imsi-catcher":{
+        "id": 1,
+        "file": "simple-imsi-catcher.py",
+        "path": "/usr/src/imsi",
+        "dbName": "imsi.sqlite",
+        "args":"--sniff --sqlite"
+    },
+    "pro-imsi-catcher":{
+        "id": 2,
+        "file": "pro-imsi-catcher.py",
+        "path": "/usr/src/proimsi",
+        "dbName": "proimsi.sqlite",
+        "args":"--sniff --sqlite"
+    },
+    "pro-catcher":{
+        "id": 3,
+        "file": "pro-imsi-catcher.py",
+        "path": "/usr/src/proimsi",
+        "dbName": "proimsi.sqlite",
+        "args":"--sniff --sqlite"
+    }
+}

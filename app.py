@@ -9,13 +9,55 @@ from datetime import datetime
 from collections import defaultdict
 import sqlite3
 import shlex
+from sqlalchemy import Column, Integer, String, DateTime
+import signal
+import time
+
 
 from models import db, Scan, ScanDetail, Observation
+def stop_process(pid: int, timeout=5) -> bool:
+    if not pid:
+        return False
 
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+
+    # wait graceful
+    for _ in range(timeout * 10):
+        if not is_process_alive(pid):
+            return True
+        time.sleep(0.1)
+
+    # force kill
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except Exception:
+        return False
+
+class ScriptRun(db.Model):
+    __tablename__ = "script_runs"
+
+    id = Column(Integer, primary_key=True)
+    script_id = Column(Integer, nullable=False)
+    pid = Column(Integer)
+    status = Column(String(20))  # running | stopped | failed
+    started_at = Column(DateTime, nullable=False)
+    stopped_at = Column(DateTime)
+    exit_code = Column(Integer)
+
+with app.app_context():
+    db.create_all()
 app = Flask(__name__)
 CORS(app)
 
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+SCRIPTS_JSON_PATH = os.path.join(BASE_DIR, "scripts.json")
 
 SCRIPT_CONFIG = {
     "imsi":  "--sniff",
@@ -52,6 +94,31 @@ LOCK = threading.Lock()
 # --------------------------
 # Helpers
 # --------------------------
+def is_process_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+def get_script_by_id(script_id: int):
+    scripts = load_scripts_config()
+
+    for _, cfg in scripts.items():
+        if cfg.get("id") == script_id:
+            return cfg
+
+    return None
+
+def load_scripts_config():
+    if not os.path.exists(SCRIPTS_JSON_PATH):
+        raise FileNotFoundError("scripts.json not found")
+
+    with open(SCRIPTS_JSON_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 def is_safe_python_file(filename: str) -> bool:
     return filename.endswith(".py") and "/" not in filename and "\\" not in filename
 
@@ -67,6 +134,44 @@ def build_command(script_file, args, sqlite_file):
         sqlite_file
     ]
 
+@app.route("/scripts/status", methods=["GET"])
+def script_status():
+    script_id = request.args.get("scriptId", type=int)
+    run_id    = request.args.get("runId", type=int)
+
+    if not script_id and not run_id:
+        return jsonify({"error": "scriptId or runId is required"}), 400
+
+    # ---- get latest run ----
+    query = ScriptRun.query
+
+    if run_id:
+        run = query.filter_by(id=run_id).first()
+    else:
+        run = query.filter_by(script_id=script_id)\
+                   .order_by(ScriptRun.started_at.desc())\
+                   .first()
+
+    if not run:
+        return jsonify({"status": "never_run"})
+
+    alive = is_process_alive(run.pid)
+
+    # ---- sync status if needed ----
+    if run.status == "running" and not alive:
+        run.status = "stopped"
+        run.stopped_at = datetime.utcnow()
+        db.session.commit()
+
+    return jsonify({
+        "runId": run.id,
+        "scriptId": run.script_id,
+        "status": run.status,
+        "pid": run.pid,
+        "startedAt": run.started_at.isoformat(),
+        "stoppedAt": run.stopped_at.isoformat() if run.stopped_at else None,
+        "isAlive": alive
+    })
 
 # --------------------------
 # Run script
@@ -75,43 +180,50 @@ def build_command(script_file, args, sqlite_file):
 def run_script():
     data = request.get_json(force=True)
 
-    script_id   = data.get("scriptId")
-    script_file = data.get("scriptFile")
-    work_dir    = data.get("workDir")
-    sqlite_file = data.get("sqliteFile")
-    args        = data.get("args", [])
-    password    = data.get("password")
+    script_id = data.get("scriptId")
+    password  = data.get("password")
 
-    # ---- validation ----
     if not script_id:
         return jsonify({"error": "scriptId is required"}), 400
+
+    if not password:
+        return jsonify({"error": "password is required"}), 400
+
+    script_cfg = get_script_by_id(script_id)
+    if not script_cfg:
+        return jsonify({"error": "script not found"}), 404
+
+    script_file = script_cfg["file"]
+    work_dir    = script_cfg["path"]
+    sqlite_file = script_cfg["dbName"]
+    args        = shlex.split(script_cfg.get("args", ""))
 
     if not is_safe_python_file(script_file):
         return jsonify({"error": "invalid scriptFile"}), 400
 
-    if not work_dir or not os.path.isabs(work_dir):
-        return jsonify({"error": "workDir must be absolute path"}), 400
-
-    if not os.path.isdir(work_dir):
-        return jsonify({"error": "workDir does not exist"}), 400
+    if not os.path.isabs(work_dir) or not os.path.isdir(work_dir):
+        return jsonify({"error": "invalid workDir"}), 400
 
     script_path = os.path.join(work_dir, script_file)
     if not os.path.isfile(script_path):
-        return jsonify({"error": "script file not found", "path": script_path}), 404
-
-    if not sqlite_file:
-        return jsonify({"error": "sqliteFile is required"}), 400
-
-    if not isinstance(args, list):
-        return jsonify({"error": "args must be an array"}), 400
+        return jsonify({"error": "script file not found"}), 404
 
     with LOCK:
         if script_id in RUNNING_SCRIPTS:
             return jsonify({"error": "script already running"}), 409
 
+    # ---------- DB: insert RUNNING ----------
+    run = ScriptRun(
+        script_id=script_id,
+        status="running",
+        started_at=datetime.utcnow()
+    )
+    db.session.add(run)
+    db.session.commit()  # run.id ساخته می‌شه
+
     command = build_command(script_file, args, sqlite_file)
+
     try:
-        print(command)
         process = subprocess.Popen(
             command,
             cwd=work_dir,
@@ -122,172 +234,106 @@ def run_script():
             bufsize=1
         )
 
-        send sudo password
         process.stdin.write(password + "\n")
         process.stdin.flush()
 
     except Exception as e:
-        return jsonify({"error": "failed to start script", "details": str(e)}), 500
+        run.status = "failed"
+        db.session.commit()
+        return jsonify({"error": "failed to start script"}), 500
+
+    # ---------- DB: save PID ----------
+    run.pid = process.pid
+    db.session.commit()
 
     with LOCK:
         RUNNING_SCRIPTS[script_id] = {
-            "process": "process",
-            "pid": "process.pid",
-            "status": "running",
-            "startedAt": datetime.utcnow().isoformat(),
-            "workDir": work_dir,
-            "script": script_file,
-            "sqlite": sqlite_file
+            "process": process,
+            "runId": run.id,
+            "pid": process.pid
         }
 
     return jsonify({
+        "runId": run.id,
         "scriptId": script_id,
         "status": "running",
-        "pid": "process.pid"
+        "pid": process.pid
     })
-
-
-# --------------------------
-# Stop script
-# --------------------------
-@app.route("/scripts/stop", methods=["POST"])
-def stop_script():
-    data = request.get_json(force=True)
-    script_id = data.get("scriptId")
-
-    if not script_id:
-        return jsonify({"error": "scriptId is required"}), 400
-
-    with LOCK:
-        entry = RUNNING_SCRIPTS.get(script_id)
-
-    if not entry:
-        return jsonify({"error": "script not running"}), 404
-
-    process = entry["process"]
-
-    try:
-        process.terminate()
-        process.wait(timeout=5)
-    except Exception:
-        process.kill()
-
-    with LOCK:
-        entry["status"] = "stopped"
-        entry["stoppedAt"] = datetime.utcnow().isoformat()
-        RUNNING_SCRIPTS.pop(script_id, None)
-
-    return jsonify({
-        "scriptId": script_id,
-        "status": "stopped"
-    })
-
-
-# --------------------------
-# Script status
-# --------------------------
-@app.route("/scripts/status/<script_id>", methods=["GET"])
-def script_status(script_id):
-    with LOCK:
-        entry = RUNNING_SCRIPTS.get(script_id)
-
-    if not entry:
-        return jsonify({
-            "scriptId": script_id,
-            "status": "not_running"
-        })
-
-    process = entry["process"]
-
-    if process.poll() is not None:
-        with LOCK:
-            entry["status"] = "exited"
-            entry["exitCode"] = process.returncode
-            RUNNING_SCRIPTS.pop(script_id, None)
-
-        return jsonify({
-            "scriptId": script_id,
-            "status": "exited",
-            "exitCode": process.returncode
-        })
-
-    return jsonify({
-        "scriptId": script_id,
-        "status": "running",
-        "pid": entry["pid"],
-        "startedAt": entry["startedAt"],
-        "workDir": entry["workDir"],
-        "script": entry["script"],
-        "sqlite": entry["sqlite"]
-    })
-
-
-# --------------------------
-# List running scripts (optional but useful)
-# --------------------------
-@app.route("/scripts", methods=["GET"])
-def list_scripts():
-    with LOCK:
-        result = {
-            k: {
-                "pid": v["pid"],
-                "status": v["status"],
-                "startedAt": v["startedAt"]
-            }
-            for k, v in RUNNING_SCRIPTS.items()
-        }
-
-    return jsonify(result)
-
-
 
 @app.route("/imsi", methods=["GET"])
 def get_imsi():
     try:
-        # params
+        # ---------------- params ----------------
         page = max(int(request.args.get("page", 0)), 0)
         size = max(int(request.args.get("size", 20)), 1)
-        db_path = request.args.get("db_path") or IMSI_SQLITE_PATH
 
-        if not os.path.isabs(db_path):
-            db_path = os.path.join(BASE_DIR, db_path)
+        script_id = request.args.get("scriptId", type=int)
+        db_path = request.args.get("db_path")
+
+        # ---------------- resolve sqlite path ----------------
+        if script_id:
+            script_cfg = get_script_by_id(script_id)
+            if not script_cfg:
+                return jsonify({"error": "script not found"}), 404
+
+            sqlite_file = script_cfg.get("dbName")
+            work_dir = script_cfg.get("path")
+
+            if not sqlite_file or not work_dir:
+                return jsonify({"error": "script db config invalid"}), 500
+
+            db_path = os.path.join(work_dir, sqlite_file)
+
+        else:
+            db_path = db_path or IMSI_SQLITE_PATH
+            if not os.path.isabs(db_path):
+                db_path = os.path.join(BASE_DIR, db_path)
+
         if not os.path.exists(db_path):
-            return jsonify({"error": "imsi sqlite file not found", "path": db_path}), 404
+            return jsonify({
+                "error": "imsi sqlite file not found",
+                "path": db_path
+            }), 404
 
-        # filters
-        imsi_filter = request.args.get("imsi")
+        # ---------------- filters ----------------
+        imsi_filter     = request.args.get("imsi")
         operator_filter = request.args.get("operator")
-        country_filter = request.args.get("country")
-        brand_filter = request.args.get("brand")
+        country_filter  = request.args.get("country")
+        brand_filter    = request.args.get("brand")
 
         conn = open_sqlite_db(db_path)
         cur = conn.cursor()
 
-        # Build WHERE clause dynamically
+        # ---------------- where clause ----------------
         where_clauses = ["imsi IS NOT NULL AND imsi != ''"]
         params = []
 
         if imsi_filter:
             where_clauses.append("imsi LIKE ?")
             params.append(f"%{imsi_filter}%")
+
         if operator_filter:
             where_clauses.append("imsioperator LIKE ?")
             params.append(f"%{operator_filter}%")
+
         if country_filter:
             where_clauses.append("imsicountry LIKE ?")
             params.append(f"%{country_filter}%")
+
         if brand_filter:
             where_clauses.append("imsibrand LIKE ?")
             params.append(f"%{brand_filter}%")
 
         where_sql = " AND ".join(where_clauses)
 
-        # total distinct IMSI with filters
-        cur.execute(f"SELECT COUNT(DISTINCT imsi) as cnt FROM observations WHERE {where_sql}", params)
-        total_row = cur.fetchone()
-        total = total_row["cnt"] if total_row and "cnt" in total_row.keys() else 0
+        # ---------------- total count ----------------
+        cur.execute(
+            f"SELECT COUNT(DISTINCT imsi) as cnt FROM observations WHERE {where_sql}",
+            params
+        )
+        total = cur.fetchone()["cnt"]
 
-        # pagination
+        # ---------------- pagination query ----------------
         offset = page * size
         grouped_sql = f"""
             SELECT
@@ -310,22 +356,29 @@ def get_imsi():
             ORDER BY last_seen DESC
             LIMIT ? OFFSET ?;
         """
+
         cur.execute(grouped_sql, (*params, size, offset))
         rows = cur.fetchall()
 
+        # ---------------- map result ----------------
+        def _iso(v):
+            if v is None:
+                return None
+            if isinstance(v, str):
+                return v
+            try:
+                return datetime.fromisoformat(v).isoformat()
+            except Exception:
+                try:
+                    return datetime.utcfromtimestamp(float(v)).isoformat()
+                except Exception:
+                    return str(v)
+
         data = []
         for r in rows:
-            def _iso(v):
-                if v is None: return None
-                if isinstance(v, str): return v
-                try: return datetime.fromisoformat(v).isoformat()
-                except: 
-                    try: return datetime.utcfromtimestamp(float(v)).isoformat()
-                    except: return str(v)
-
             data.append({
                 "imsi": r["imsi"],
-                "count": int(r["count"]) if r["count"] is not None else 0,
+                "count": int(r["count"] or 0),
                 "tmsi1": r["tmsi1"],
                 "tmsi2": r["tmsi2"],
                 "country": r["country"],
@@ -342,6 +395,8 @@ def get_imsi():
         conn.close()
 
         return jsonify({
+            "scriptId": script_id,
+            "dbPath": db_path,
             "total": total,
             "page": page,
             "size": size,
@@ -349,70 +404,41 @@ def get_imsi():
         })
 
     except Exception as e:
-        return jsonify({"error": "internal server error", "details": str(e), "trace": traceback.format_exc()}), 500
+        return jsonify({
+            "error": "internal server error",
+            "details": str(e),
+            "trace": traceback.format_exc()
+        }), 500
 
-# @app.route("/run/script", methods=["POST"])
-# def run_script():
-#     data = request.get_json()
-#     print("RAW DATA:", data)
-#     script_type = data.get("scriptType")
-#     file_name   = data.get("filePath")   # فقط اسم فایل
-#     password    = data.get("password")
-#     work_dir    = data.get("workDir")
+@app.route("/script-list", methods=["GET"])
+def script_list():
+    """
+    Returns:
+    [
+      { "id": 1, "name": "simple-imsi-catcher" },
+      { "id": 2, "name": "pro-imsi-catcher" }
+    ]
+    """
+    try:
+        scripts = load_scripts_config()
 
-#     # ---- validation ----
-#     if script_type not in SCRIPT_CONFIG:
-#         return jsonify({"error": "Invalid scriptType"}), 400
+        result = []
+        for name, cfg in scripts.items():
+            result.append({
+                "id": cfg.get("id"),
+                "name": name
+            })
 
-#     # if not work_dir or not os.path.isabs(work_dir):
-#     #     return jsonify({"error": "workDir must be an absolute path"}), 400
+        return jsonify(result)
 
-#     if not os.path.isdir(work_dir):
-#         return jsonify({"error": "workDir does not exist"}), 400
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 500
 
-#     if not file_name:
-#         return jsonify({"error": "filePath (file name) is required"}), 400
-
-#     script_path = os.path.join(work_dir, file_name)
-
-#     if not os.path.isfile(script_path):
-#         return jsonify({"error": "script file not found", "path": script_path}), 404
-
-#     args = SCRIPT_CONFIG[script_type]
-
-#     command = [
-#         "sudo",
-#         "-S",
-#         "python3",
-#         script_path,
-#         *args.split(),
-#         "--sqlite",
-#         "imsi.sqlite"
-#     ]
-
-#     try:
-#         process = subprocess.Popen(
-#             command,
-#             cwd=work_dir,                 
-#             stdin=subprocess.PIPE,
-#             stdout=subprocess.PIPE,
-#             stderr=subprocess.STDOUT,
-#             text=True,
-#             bufsize=1
-#         )
-
-#         process.stdin.write(password + "\n")
-#         process.stdin.flush()
-
-#     except Exception as e:
-#         return jsonify({"error": "failed to start process", "details": str(e)}), 500
-
-#     return jsonify({
-#         "status": "started",
-#         "workDir": work_dir,
-#         "script": script_path,
-#         "command": " ".join(command)
-#     })
+    except Exception as e:
+        return jsonify({
+            "error": "failed to load scripts",
+            "details": str(e)
+        }), 500
 
 
 if __name__ == "__main__":
