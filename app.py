@@ -23,34 +23,9 @@ import shlex
 from sqlalchemy import Column, Integer, String, DateTime
 import signal
 import time
+from flask_sqlalchemy import SQLAlchemy
 
-
-from models import db, Scan, ScanDetail, Observation
-def stop_process(pid: int, timeout=5) -> bool:
-     """
-    Gracefully stops a process using SIGTERM.
-    Forces kill if needed.
-    """
-    if not pid:
-        return False
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-
-    # wait graceful
-    for _ in range(timeout * 10):
-        if not is_process_alive(pid):
-            return True
-        time.sleep(0.1)
-
-    # force kill
-    try:
-        os.kill(pid, signal.SIGKILL)
-        return True
-    except Exception:
-        return False
+db = SQLAlchemy()
 
 class ScriptRun(db.Model):
     """
@@ -68,15 +43,12 @@ class ScriptRun(db.Model):
     started_at = Column(DateTime, nullable=False)
     stopped_at = Column(DateTime)
     exit_code = Column(Integer)
-
-with app.app_context():
-    db.create_all()
 app = Flask(__name__)
 CORS(app)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
+IMSI_SQLITE_PATH = os.path.join(BASE_DIR, "imsi.sqlite")
 
 SCRIPTS_JSON_PATH = os.path.join(BASE_DIR, "scripts.json")
 
@@ -95,7 +67,7 @@ with app.app_context():
     db.create_all()
 
 
-IMSI_SQLITE_PATH = os.path.join(BASE_DIR, "imsi.sqlite")
+
 
 # --------------------------
 # helper: safe open sqlite and run query
@@ -105,6 +77,32 @@ def open_sqlite_db(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+"""
+    Gracefully stops a process using SIGTERM.
+    Forces kill if needed.
+"""
+def stop_process(pid: int, timeout=5) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+
+    # wait graceful
+    for _ in range(timeout * 10):
+        if not is_process_alive(pid):
+            return True
+        time.sleep(0.1)
+
+    # force kill
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except Exception:
+        return False
 
 # --------------------------
 # In-memory process registry
