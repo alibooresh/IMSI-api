@@ -1,3 +1,14 @@
+"""
+Main Flask application for managing and monitoring external IMSI catcher scripts.
+
+Responsibilities:
+- Load script definitions from scripts.json
+- Execute scripts with sudo
+- Track running processes in memory
+- Persist run state in database
+- Read data from script-generated SQLite databases
+"""
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import subprocess
@@ -16,6 +27,10 @@ import time
 
 from models import db, Scan, ScanDetail, Observation
 def stop_process(pid: int, timeout=5) -> bool:
+     """
+    Gracefully stops a process using SIGTERM.
+    Forces kill if needed.
+    """
     if not pid:
         return False
 
@@ -38,6 +53,12 @@ def stop_process(pid: int, timeout=5) -> bool:
         return False
 
 class ScriptRun(db.Model):
+    """
+    Stores execution history of scripts.
+
+    One record is created per execution.
+    Used to track status even after app restart.
+    """
     __tablename__ = "script_runs"
 
     id = Column(Integer, primary_key=True)
@@ -88,6 +109,10 @@ def open_sqlite_db(path):
 # --------------------------
 # In-memory process registry
 # --------------------------
+"""
+Keeps currently running scripts in memory.
+This allows fast status check and stop operations.
+"""
 RUNNING_SCRIPTS = {}
 LOCK = threading.Lock()
 
@@ -95,6 +120,9 @@ LOCK = threading.Lock()
 # Helpers
 # --------------------------
 def is_process_alive(pid: int) -> bool:
+    """
+    Checks whether a process with given PID is alive.
+    """
     if not pid:
         return False
     try:
@@ -104,6 +132,9 @@ def is_process_alive(pid: int) -> bool:
         return False
 
 def get_script_by_id(script_id: int):
+    """
+    Returns script configuration by script ID.
+    """
     scripts = load_scripts_config()
 
     for _, cfg in scripts.items():
@@ -113,6 +144,15 @@ def get_script_by_id(script_id: int):
     return None
 
 def load_scripts_config():
+    """
+    Loads scripts.json configuration file.
+    Each script defines:
+      - id
+      - file
+      - path
+      - args
+      - dbName
+    """
     if not os.path.exists(SCRIPTS_JSON_PATH):
         raise FileNotFoundError("scripts.json not found")
 
@@ -124,6 +164,9 @@ def is_safe_python_file(filename: str) -> bool:
 
 
 def build_command(script_file, args, sqlite_file):
+    """
+    Builds sudo execution command for script.
+    """
     return [
         "sudo",
         "-S",
@@ -133,44 +176,107 @@ def build_command(script_file, args, sqlite_file):
         "--sqlite",
         sqlite_file
     ]
-
 @app.route("/scripts/status", methods=["GET"])
 def script_status():
+    """
+    Returns current status of script execution.
+
+    Query Params:
+      - scriptId OR runId
+
+    Output:
+    {
+      status: running | stopped | failed | never_run
+    }
+    """
     script_id = request.args.get("scriptId", type=int)
-    run_id    = request.args.get("runId", type=int)
 
-    if not script_id and not run_id:
-        return jsonify({"error": "scriptId or runId is required"}), 400
+    if not script_id:
+        return "unknown", 400
 
-    # ---- get latest run ----
-    query = ScriptRun.query
+    # ---------- 1. check running (in-memory) ----------
+    with LOCK:
+        running = RUNNING_SCRIPTS.get(script_id)
 
-    if run_id:
-        run = query.filter_by(id=run_id).first()
-    else:
-        run = query.filter_by(script_id=script_id)\
-                   .order_by(ScriptRun.started_at.desc())\
-                   .first()
+    if running:
+        process = running["process"]
 
-    if not run:
-        return jsonify({"status": "never_run"})
+        # process still alive
+        if process.poll() is None:
+            return "running"
 
-    alive = is_process_alive(run.pid)
+        # process exited -> cleanup
+        exit_code = process.returncode
+        run_id = running["runId"]
 
-    # ---- sync status if needed ----
-    if run.status == "running" and not alive:
-        run.status = "stopped"
+        with app.app_context():
+            run = ScriptRun.query.get(run_id)
+            if run:
+                run.status = "stopped" if exit_code == 0 else "failed"
+                run.exit_code = exit_code
+                run.stopped_at = datetime.utcnow()
+                db.session.commit()
+
+        with LOCK:
+            RUNNING_SCRIPTS.pop(script_id, None)
+
+        return "stopped" if exit_code == 0 else "failed"
+
+    # ---------- 2. check database ----------
+    last_run = (
+        ScriptRun.query
+        .filter_by(script_id=script_id)
+        .order_by(ScriptRun.started_at.desc())
+        .first()
+    )
+
+    if not last_run:
+        return "unknown"
+
+    return last_run.status or "unknown"
+@app.route("/scripts/stop", methods=["POST"])
+def stop_script():
+    """
+    Stops a running script by scriptId.
+
+    Input:
+    {
+      "scriptId": number
+    }
+
+    - Sends SIGTERM
+    - Updates DB status
+    - Removes from memory registry
+    """
+    data = request.get_json(force=True)
+    script_id = data.get("scriptId")
+
+    if not script_id:
+        return jsonify({"error": "scriptId is required"}), 400
+
+    with LOCK:
+        running = RUNNING_SCRIPTS.get(script_id)
+
+    if not running:
+        return jsonify({"status": "not_running"}), 409
+
+    pid = running["pid"]
+    run_id = running["runId"]
+
+    stopped = stop_process(pid)
+
+    run = ScriptRun.query.get(run_id)
+    if run:
+        run.status = "stopped" if stopped else "failed"
         run.stopped_at = datetime.utcnow()
         db.session.commit()
 
+    with LOCK:
+        RUNNING_SCRIPTS.pop(script_id, None)
+
     return jsonify({
-        "runId": run.id,
-        "scriptId": run.script_id,
-        "status": run.status,
-        "pid": run.pid,
-        "startedAt": run.started_at.isoformat(),
-        "stoppedAt": run.stopped_at.isoformat() if run.stopped_at else None,
-        "isAlive": alive
+        "scriptId": script_id,
+        "status": "stopped" if stopped else "failed"
     })
 
 # --------------------------
@@ -178,6 +284,20 @@ def script_status():
 # --------------------------
 @app.route("/scripts/run", methods=["POST"])
 def run_script():
+    """
+    Starts a script by scriptId.
+
+    Input:
+    {
+      "scriptId": number,
+      "password": "sudo_password"
+    }
+
+    - Validates script
+    - Prevents double run
+    - Stores run in DB
+    - Executes script using sudo
+    """
     data = request.get_json(force=True)
 
     script_id = data.get("scriptId")
@@ -262,6 +382,20 @@ def run_script():
 
 @app.route("/imsi", methods=["GET"])
 def get_imsi():
+    """
+    Reads IMSI data from script-specific SQLite database.
+
+    Query Params:
+      - scriptId (optional)
+      - page
+      - size
+      - imsi
+      - operator
+      - country
+      - brand
+
+    Automatically resolves SQLite path based on scriptId.
+    """
     try:
         # ---------------- params ----------------
         page = max(int(request.args.get("page", 0)), 0)
@@ -413,10 +547,12 @@ def get_imsi():
 @app.route("/script-list", methods=["GET"])
 def script_list():
     """
-    Returns:
+    Returns list of available scripts.
+
+    Response:
     [
-      { "id": 1, "name": "simple-imsi-catcher" },
-      { "id": 2, "name": "pro-imsi-catcher" }
+      { "id": 1, "name": "imsi" },
+      { "id": 2, "name": "imsi2" }
     ]
     """
     try:
