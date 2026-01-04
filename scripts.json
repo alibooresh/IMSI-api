@@ -2,7 +2,7 @@
     "simple-imsi-catcher":{
         "id": 1,
         "file": "simple-imsi-catcher.py",
-        "path": "/usr/src/imsi",
+        "path": "./",
         "dbName": "imsi.sqlite",
         "args":"--sniff --sqlite"
     },

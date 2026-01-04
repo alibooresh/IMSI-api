@@ -43,6 +43,17 @@ class ScriptRun(db.Model):
     started_at = Column(DateTime, nullable=False)
     stopped_at = Column(DateTime)
     exit_code = Column(Integer)
+class IMSIBlacklist(db.Model):
+    """
+    Stores blacklisted IMSI numbers.
+
+    Used to mark IMSIs as blocked in IMSI queries.
+    """
+    __tablename__ = "imsi_blacklist"
+
+    id = Column(Integer, primary_key=True)
+    imsi = Column(String(32), nullable=False, unique=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 app = Flask(__name__)
 CORS(app)
 
@@ -77,6 +88,22 @@ def open_sqlite_db(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+def resolve_sqlite_path(script_id: int):
+    print(script_id)
+    script_cfg = get_script_by_id(script_id)
+    print(script_cfg)
+    if not script_cfg:
+        return None
+
+    sqlite_file = script_cfg.get("dbName")
+    work_dir    = script_cfg.get("path")
+    print(sqlite_file)
+    print(work_dir)
+    if not sqlite_file or not work_dir:
+        return None
+
+    return os.path.join(work_dir, sqlite_file)
 
 
 """
@@ -184,7 +211,7 @@ def script_status():
 
     Output:
     {
-      status: running | stopped | failed | never_run
+      status: running | stopped | failed | unknown
     }
     """
     script_id = request.args.get("scriptId", type=int)
@@ -505,11 +532,16 @@ def get_imsi():
                     return datetime.utcfromtimestamp(float(v)).isoformat()
                 except Exception:
                     return str(v)
-
+        # -------- load blacklist once --------
+        blacklisted_imsis = {
+            row.imsi
+            for row in IMSIBlacklist.query.all()
+        }
         data = []
         for r in rows:
             data.append({
                 "imsi": r["imsi"],
+                "isBlocked": r["imsi"] in blacklisted_imsis,
                 "count": int(r["count"] or 0),
                 "tmsi1": r["tmsi1"],
                 "tmsi2": r["tmsi2"],
@@ -573,6 +605,168 @@ def script_list():
             "error": "failed to load scripts",
             "details": str(e)
         }), 500
+
+@app.route("/dashboard/operators", methods=["GET"])
+def dashboard_operators():
+    script_id = request.args.get("scriptId", type=int)
+    if not script_id:
+        return jsonify({"error": "scriptId is required"}), 400
+
+    db_path = resolve_sqlite_path(script_id)
+    print(db_path)
+    if not db_path or not os.path.exists(db_path):
+        return jsonify({"error": "sqlite db not found"}), 404
+
+    conn = open_sqlite_db(db_path)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            imsioperator AS operator,
+            COUNT(*) AS count
+        FROM observations
+        WHERE imsioperator IS NOT NULL AND imsioperator != ''
+        GROUP BY imsioperator
+        ORDER BY count DESC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return jsonify([
+        {
+            "operator": r["operator"],
+            "count": r["count"]
+        }
+        for r in rows
+    ])
+
+@app.route("/dashboard/timeline", methods=["GET"])
+def dashboard_timeline():
+    script_id = request.args.get("scriptId", type=int)
+    if not script_id:
+        return jsonify({"error": "scriptId is required"}), 400
+
+    db_path = resolve_sqlite_path(script_id)
+    print(db_path)
+    if not db_path or not os.path.exists(db_path):
+        return jsonify({"error": "sqlite db not found"}), 404
+
+    conn = open_sqlite_db(db_path)
+    cur = conn.cursor()
+
+    # SQLite: group by hour
+    cur.execute("""
+        SELECT
+            strftime('%Y-%m-%d %H:00', stamp) AS time,
+            COUNT(*) AS count
+        FROM observations
+        WHERE stamp IS NOT NULL
+        GROUP BY time
+        ORDER BY time ASC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return jsonify([
+        {
+            "time": r["time"],
+            "count": r["count"]
+        }
+        for r in rows
+    ])
+
+@app.route("/dashboard/top-cells", methods=["GET"])
+def dashboard_top_cells():
+    script_id = request.args.get("scriptId", type=int)
+    limit = request.args.get("limit", default=10, type=int)
+
+    if not script_id:
+        return jsonify({"error": "scriptId is required"}), 400
+
+    db_path = resolve_sqlite_path(script_id)
+    print(db_path)
+    if not db_path or not os.path.exists(db_path):
+        return jsonify({"error": "sqlite db not found"}), 404
+
+    conn = open_sqlite_db(db_path)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            cell AS cellId,
+            lac,
+            COUNT(*) AS count
+        FROM observations
+        WHERE cell IS NOT NULL AND lac IS NOT NULL
+        GROUP BY cell, lac
+        ORDER BY count DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return jsonify([
+        {
+            "cellId": r["cellId"],
+            "lac": r["lac"],
+            "count": r["count"]
+        }
+        for r in rows
+    ])
+
+@app.route("/blacklist", methods=["POST"])
+def add_to_blacklist():
+    data = request.get_json(force=True)
+    imsi = data.get("imsi")
+
+    if not imsi:
+        return jsonify({"error": "imsi is required"}), 400
+
+    exists = IMSIBlacklist.query.filter_by(imsi=imsi).first()
+    if exists:
+        return jsonify({"error": "imsi already blacklisted"}), 409
+
+    entry = IMSIBlacklist(imsi=imsi)
+    db.session.add(entry)
+    db.session.commit()
+
+    return jsonify({
+        "id": entry.id,
+        "imsi": entry.imsi,
+        "createdAt": entry.created_at.isoformat()
+    })
+
+
+@app.route("/blacklist", methods=["GET"])
+def list_blacklist():
+    rows = IMSIBlacklist.query.order_by(IMSIBlacklist.created_at.desc()).all()
+
+    return jsonify([
+        {
+            "id": r.id,
+            "imsi": r.imsi,
+            "createdAt": r.created_at.isoformat()
+        }
+        for r in rows
+    ])
+
+@app.route("/blacklist/<int:id>", methods=["DELETE"])
+def delete_blacklist(id):
+    entry = IMSIBlacklist.query.get(id)
+
+    if not entry:
+        return jsonify({"error": "not found"}), 404
+
+    db.session.delete(entry)
+    db.session.commit()
+
+    return jsonify({
+        "message": "removed",
+        "id": id
+    })
 
 
 if __name__ == "__main__":
