@@ -24,6 +24,7 @@ from sqlalchemy import Column, Integer, String, DateTime
 import signal
 import time
 from flask_sqlalchemy import SQLAlchemy
+import re
 
 db = SQLAlchemy()
 
@@ -187,6 +188,14 @@ def load_scripts_config():
 def is_safe_python_file(filename: str) -> bool:
     return filename.endswith(".py") and "/" not in filename and "\\" not in filename
 
+def extract_msin(imsi: str | None) -> str | None:
+    if not imsi:
+        return None
+
+    digits = re.sub(r"\D", "", imsi)
+
+    # MSIN = everything after MCC(3) + MNC(2 or 3)
+    return digits[5:] if len(digits) > 5 else None
 
 def build_command(script_file, args, sqlite_file):
     """
@@ -539,9 +548,10 @@ def get_imsi():
         }
         data = []
         for r in rows:
+            msin = extract_msin(r["imsi"])
             data.append({
                 "imsi": r["imsi"],
-                "isBlocked": r["imsi"] in blacklisted_imsis,
+                "isBlocked": msin in blacklisted_imsis,
                 "count": int(r["count"] or 0),
                 "tmsi1": r["tmsi1"],
                 "tmsi2": r["tmsi2"],
